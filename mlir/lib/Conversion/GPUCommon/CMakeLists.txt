@@ -8,6 +8,8 @@ add_mlir_conversion_library(MLIRGPUtoGPURuntimeTransforms
 
   LINK_COMPONENTS
   Core
+  MC
+  MCParser
 
   LINK_LIBS PUBLIC
   MLIRGPU

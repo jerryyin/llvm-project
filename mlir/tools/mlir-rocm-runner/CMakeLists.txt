@@ -30,7 +30,9 @@ if(MLIR_ROCM_RUNNER_ENABLED)
   endif()
 
   # Locate HIP runtime library.
-  find_library(ROCM_RUNTIME_LIBRARY hip_hcc)
+  find_library(ROCM_RUNTIME_LIBRARY hip_hcc
+                     PATHS "${HIP_PATH}/lib")
+
 
   # Set HIP compile-time flags.
   add_definitions(-D__HIP_PLATFORM_HCC__)
@@ -59,6 +61,10 @@ if(MLIR_ROCM_RUNNER_ENABLED)
     lldDriver
     lldELF
     LLVMCore
+    LLVMAMDGPUInfo
+    LLVMAMDGPUDesc
+    LLVMNVPTXInfo
+    LLVMNVPTXDesc
     LLVMLTO
     LLVMOption
     LLVMSupport
