@@ -36,40 +36,31 @@ getTransferOpAdapter(TransferWriteOp xferOp, ArrayRef<Value> operands) {
   return TransferWriteOpOperandAdaptor(operands);
 }
 
-bool isMinorIdentity(AffineMap map, unsigned rank) {
-  if (map.getNumResults() < rank)
-    return false;
-  unsigned startDim = map.getNumDims() - rank;
-  for (unsigned i = 0; i < rank; ++i)
-    if (map.getResult(i) != getAffineDimExpr(startDim + i, map.getContext()))
-      return false;
-  return true;
-}
-
 LogicalResult replaceTransferOpWithMubuf(
     ConversionPatternRewriter &rewriter, ArrayRef<Value> operands,
     LLVMTypeConverter &typeConverter, Location loc, TransferReadOp xferOp,
-    LLVM::LLVMType &vecTy, Value &dwordConfig, Value &int32zero,
-    Value &offsetSizeInBytes, Value &int1False) {
-  rewriter.replaceOpWithNewOp<ROCDL::MubufLoadOp>(xferOp, vecTy, dwordConfig,
-                                                  int32zero, offsetSizeInBytes,
-                                                  int1False, int1False);
+    LLVM::LLVMType &vecTy, Value &dwordConfig, Value &int32Zero,
+    Value &offsetSizeInBytes, Value &glc, Value &slc) {
+  rewriter.replaceOpWithNewOp<ROCDL::MubufLoadOp>(
+      xferOp, vecTy, dwordConfig, int32Zero, offsetSizeInBytes, glc, slc);
   return success();
 }
 
 LogicalResult replaceTransferOpWithMubuf(
     ConversionPatternRewriter &rewriter, ArrayRef<Value> operands,
     LLVMTypeConverter &typeConverter, Location loc, TransferWriteOp xferOp,
-    LLVM::LLVMType &vecTy, Value &dwordConfig, Value &int32zero,
-    Value &offsetSizeInBytes, Value &int1False) {
+    LLVM::LLVMType &vecTy, Value &dwordConfig, Value &int32Zero,
+    Value &offsetSizeInBytes, Value &glc, Value &slc) {
   auto adaptor = TransferWriteOpOperandAdaptor(operands);
-  rewriter.replaceOpWithNewOp<ROCDL::MubufStoreOp>(
-      xferOp, adaptor.vector(), dwordConfig, int32zero, offsetSizeInBytes,
-      int1False, int1False);
+  rewriter.replaceOpWithNewOp<ROCDL::MubufStoreOp>(xferOp, adaptor.vector(),
+                                                   dwordConfig, int32Zero,
+                                                   offsetSizeInBytes, glc, slc);
 
   return success();
 }
 
+// Conversion pattern that converts a 1-D vector transfer read/write op in a
+// sequence of:
 template <typename ConcreteOp>
 class VectorTransferConversion : public ConvertToLLVMPattern {
 public:
@@ -88,11 +79,13 @@ public:
         llvm::size(xferOp.indices()) == 0)
       return failure();
 
-    if (!isMinorIdentity(xferOp.permutation_map(),
-                         xferOp.getVectorType().getRank()))
+    if (xferOp.permutation_map() !=
+        AffineMap::getMinorIdentityMap(xferOp.permutation_map().getNumInputs(),
+                                       xferOp.getVectorType().getRank(),
+                                       op->getContext()))
       return failure();
 
-    // Have it handled in vector->llvm conversion pass
+    // Have it handled in vector->llvm conversion pass.
     if (!xferOp.isMaskedDim(0))
       return failure();
 
@@ -102,15 +95,20 @@ public:
     unsigned vecWidth = vecTy.getVectorNumElements();
     Location loc = op->getLoc();
 
-    if (vecWidth != 1 && vecWidth != 2 && vecWidth != 4)
+    // The backend result vector scalarization have trouble scalarize
+    // <1 x ty> result, exclude the x1 width from the lowering.
+    if (vecWidth != 2 && vecWidth != 4)
       return failure();
 
-    // Obtain dataPtr and elementType from the memref
+    // Obtain dataPtr and elementType from the memref.
     MemRefType memRefType = xferOp.getMemRefType();
     auto elementType = memRefType.getElementType();
     auto convertedPtrType = typeConverter.convertType(elementType)
                                 .template cast<LLVM::LLVMType>()
                                 .getPointerTo(0);
+    // Note that the dataPtr starts at the offset address specified by
+    // indices, so no need to calculat offset size in bytes again in
+    // the MUBUF instruction.
     Value dataPtr = getDataPtr(loc, memRefType, adaptor.memref(),
                                adaptor.indices(), rewriter, getModule());
 
@@ -118,10 +116,10 @@ public:
       dataPtr = rewriter.create<LLVM::AddrSpaceCastOp>(loc, convertedPtrType,
                                                        dataPtr);
 
-    // Create a <4 x i32> dwordConfig with:
-    // Word 1 and 2: address of dataPtr
-    // Word 3: -1
-    // Word 4: 0x27000
+    // 1. Create and fill a <4 x i32> dwordConfig with:
+    //    1st two elements holding the address of dataPtr.
+    //    3rd element: -1.
+    //    4th element: 0x27000.
     SmallVector<int32_t, 4> indices{0, 0, -1, 0x27000};
     Type i32Ty = rewriter.getIntegerType(32);
     VectorType i32Vecx4 = VectorType::get(4, i32Ty);
@@ -132,7 +130,7 @@ public:
                                                        constConfig);
 
     // Treat first two element of <4 x i32> as i64, and save the dataPtr
-    // to it
+    // to it.
     Type i64Ty = rewriter.getIntegerType(64);
     Value i64x2Ty = rewriter.create<LLVM::BitcastOp>(
         loc,
@@ -150,32 +148,15 @@ public:
     dwordConfig =
         rewriter.create<LLVM::BitcastOp>(loc, toLLVMTy(i32Vecx4), dwordConfig);
 
-    // Access and calculate offset in byte
-    unsigned lastIndex = llvm::size(xferOp.indices()) - 1;
-    Value offsetIndex = *(xferOp.indices().begin() + lastIndex);
-    // Compute the size of an individual element.
-    Value nullPtr = rewriter.create<LLVM::NullOp>(loc, convertedPtrType);
-    Value one = createIndexConstant(rewriter, loc, 1);
-    Value elementSizeInPtr = rewriter.create<LLVM::GEPOp>(
-        loc, convertedPtrType, ArrayRef<Value>{nullPtr, one});
-    Value elementSize = rewriter.create<LLVM::PtrToIntOp>(loc, getIndexType(),
-                                                          elementSizeInPtr);
-    // offsetInByte = offset x elementSize
-    Value offsetSizeInBytes = rewriter.create<LLVM::MulOp>(
-        loc, getIndexType(), offsetIndex, elementSize);
-    offsetSizeInBytes = rewriter.create<LLVM::TruncOp>(
-        loc, toLLVMTy(i32Ty).template cast<LLVM::LLVMType>(),
-        offsetSizeInBytes);
-
+    // 2. Rewrite op as a buffer read or write.
     Value int1False = rewriter.create<ConstantOp>(
         loc, rewriter.getIntegerType(1),
         rewriter.getIntegerAttr(rewriter.getIntegerType(1), 0));
-    Value int32zero = rewriter.create<ConstantOp>(
+    Value int32Zero = rewriter.create<ConstantOp>(
         loc, i32Ty, rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
-
     return replaceTransferOpWithMubuf(rewriter, operands, typeConverter, loc,
-                                      xferOp, vecTy, dwordConfig, int32zero,
-                                      offsetSizeInBytes, int1False);
+                                      xferOp, vecTy, dwordConfig, int32Zero,
+                                      int32Zero, int1False, int1False);
   }
 };
 } // end anonymous namespace
