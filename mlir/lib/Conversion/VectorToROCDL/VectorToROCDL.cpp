@@ -12,7 +12,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/VectorToROCDL/VectorToROCDL.h"
+
+#include "../PassDetail.h"
 #include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
+#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVMPass.h"
 #include "mlir/Dialect/GPU/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -123,11 +126,9 @@ public:
     SmallVector<int32_t, 4> indices{0, 0, -1, 0x27000};
     Type i32Ty = rewriter.getIntegerType(32);
     VectorType i32Vecx4 = VectorType::get(4, i32Ty);
-    Value constConfig = rewriter.create<ConstantOp>(
-        loc, i32Vecx4,
+    Value constConfig = rewriter.create<LLVM::ConstantOp>(
+        loc, toLLVMTy(i32Vecx4),
         DenseElementsAttr::get(i32Vecx4, ArrayRef<int32_t>(indices)));
-    constConfig = rewriter.create<LLVM::DialectCastOp>(loc, toLLVMTy(i32Vecx4),
-                                                       constConfig);
 
     // Treat first two element of <4 x i32> as i64, and save the dataPtr
     // to it.
@@ -149,11 +150,12 @@ public:
         rewriter.create<LLVM::BitcastOp>(loc, toLLVMTy(i32Vecx4), dwordConfig);
 
     // 2. Rewrite op as a buffer read or write.
-    Value int1False = rewriter.create<ConstantOp>(
-        loc, rewriter.getIntegerType(1),
+    Value int1False = rewriter.create<LLVM::ConstantOp>(
+        loc, toLLVMTy(rewriter.getIntegerType(1)),
         rewriter.getIntegerAttr(rewriter.getIntegerType(1), 0));
-    Value int32Zero = rewriter.create<ConstantOp>(
-        loc, i32Ty, rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
+    Value int32Zero = rewriter.create<LLVM::ConstantOp>(
+        loc, toLLVMTy(i32Ty),
+        rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
     return replaceTransferOpWithMubuf(rewriter, operands, typeConverter, loc,
                                       xferOp, vecTy, dwordConfig, int32Zero,
                                       int32Zero, int1False, int1False);
@@ -166,4 +168,32 @@ void mlir::populateVectorToROCDLConversionPatterns(
   MLIRContext *ctx = converter.getDialect()->getContext();
   patterns.insert<VectorTransferConversion<TransferReadOp>,
                   VectorTransferConversion<TransferWriteOp>>(ctx, converter);
+}
+
+namespace {
+struct LowerVectorToROCDLPass
+    : public ConvertVectorToROCDLBase<LowerVectorToROCDLPass> {
+  void runOnOperation() override;
+};
+} // namespace
+
+void LowerVectorToROCDLPass::runOnOperation() {
+  LLVMTypeConverter converter(&getContext());
+  OwningRewritePatternList patterns;
+
+  populateVectorToROCDLConversionPatterns(converter, patterns);
+  populateStdToLLVMConversionPatterns(converter, patterns);
+
+  LLVMConversionTarget target(getContext());
+  target.addLegalDialect<ROCDL::ROCDLDialect>();
+
+  if (failed(applyPartialConversion(getOperation(), target, patterns,
+                                    &converter))) {
+    signalPassFailure();
+  }
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+mlir::createConvertVectorToROCDLPass() {
+  return std::make_unique<LowerVectorToROCDLPass>();
 }

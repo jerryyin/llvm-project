@@ -8,19 +8,21 @@
 #ifndef MLIR_CONVERSION_VECTORTOROCDL_VECTORTOROCDL_H_
 #define MLIR_CONVERSION_VECTORTOROCDL_VECTORTOROCDL_H_
 
-#include "mlir/IR/MLIRContext.h"
-#include <memory>
+#include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir {
 class LLVMTypeConverter;
 class OwningRewritePatternList;
-
+class ModuleOp;
 template <typename OpT>
 class OperationPass;
 
 /// Collect a set of patterns to convert from the GPU dialect to ROCDL.
 void populateVectorToROCDLConversionPatterns(
     LLVMTypeConverter &converter, OwningRewritePatternList &patterns);
-} // namespace mlir
 
+/// Create a pass to convert vector operations to the LLVMIR dialect.
+std::unique_ptr<OperationPass<ModuleOp>> createConvertVectorToROCDLPass();
+
+} // namespace mlir
 #endif // MLIR_CONVERSION_VECTORTOROCDL_VECTORTOROCDL_H_
