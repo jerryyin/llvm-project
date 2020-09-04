@@ -75,6 +75,14 @@ extern "C" MlirHandle CreateMlirHandle(const char *arguments) {
       return std::stoul(argMap[argKey]);
     };
 
+#if 0
+    // TODO: Enable this
+    // MIOpen has NCHW as layout string for all three tensors
+    std::string inLayout = translateLayout(argMap["in_layout"], std::string("NCHW"), std::string("nchw"));
+    std::string filLayout = translateLayout(argMap["fil_layout"], std::string("NCHW"), std::string("kcyx"));
+    std::string outLayout = translateLayout(argMap["out_layout"], std::string("NCHW"), std::string("nkhw"));
+#endif
+
     SmallString<128> kernelName;
     ModuleOp module = handle->getModule();
     populateConvolutionLogic(
